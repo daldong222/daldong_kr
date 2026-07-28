@@ -1,7 +1,6 @@
-// 연기금 수급 프록시 — 네이버 증권 모바일 API (JSON)
+// 연기금 수급 프록시 — 네이버 증권 모바일 API
 // GET /api/pension            → 전체 데이터
-// GET /api/pension?probe=1    → 연결 진단용
-// 확인된 엔드포인트: m.stock.naver.com/api/index/KOSPI/trend
+// GET /api/pension?probe=1    → 원본 응답 그대로 반환 (구조 확인용)
 
 const UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1";
 const TREND = "https://m.stock.naver.com/api/index/KOSPI/trend?pageSize=40";
@@ -11,62 +10,63 @@ async function getText(url) {
     headers: { "User-Agent": UA, "Referer": "https://m.stock.naver.com/", "Accept": "application/json", "Accept-Language": "ko-KR,ko;q=0.9" },
   });
   const t = await r.text();
-  if (!r.ok) throw new Error("naver " + r.status + ":" + t.slice(0, 40));
-  return t;
+  return { status: r.status, text: t };
 }
-async function getJSON(url) {
-  const t = await getText(url);
-  try { return JSON.parse(t); } catch (e) { throw new Error("parse:" + t.slice(0, 60)); }
-}
-
-// 문자열 숫자(부호·콤마 포함) → 정수(원)
 const num = (v) => { const n = Number(String(v ?? "").replace(/[,\s]/g, "")); return isNaN(n) ? 0 : n; };
 
-// 응답 배열에서 연기금 값을 여러 후보 필드명으로 탐색
-function pensionOf(r) {
-  const keys = ["pensionFundValue", "pensionValue", "pensionFund", "pension", "trustValue", "nationalPensionValue"];
-  for (const k of keys) if (r[k] != null) return num(r[k]);
-  return null; // 없으면 null
+// 응답에서 배열 찾기 (형태가 어떻든 대응)
+function findArray(j) {
+  if (Array.isArray(j)) return j;
+  if (!j || typeof j !== "object") return [];
+  for (const k of ["trends", "result", "list", "data", "items", "content"]) {
+    if (Array.isArray(j[k])) return j[k];
+    if (j[k] && Array.isArray(j[k].list)) return j[k].list;
+  }
+  // 한 단계 더 깊이
+  for (const k in j) if (Array.isArray(j[k])) return j[k];
+  return [];
 }
-
-async function trend() {
-  const j = await getJSON(TREND);
-  const arr = Array.isArray(j) ? j : (j.trends || j.result || j.list || j.data || []);
-  return arr.map((r) => {
-    const p = pensionOf(r);
-    return {
-      d: String(r.bizdate || r.localTradedAt || r.date || ""),
-      indi: num(r.personalValue ?? r.individualValue),
-      foreign: num(r.foreignValue ?? r.foreignerValue),
-      inst: num(r.institutionalValue ?? r.organValue),
-      pension: p,                                  // null 가능
-      kospi: num(r.closePrice ?? r.closeVal ?? r.ncv ?? r.nv),
-    };
-  }).filter((x) => x.d);
+function pensionOf(r) {
+  for (const k of Object.keys(r)) {
+    if (/pension|연기금/i.test(k)) return num(r[k]);
+  }
+  return null;
 }
 
 module.exports = async (req, res) => {
-  const out = { ok: false, ts: Date.now(), steps: {} };
+  const out = { ok: false, ts: Date.now() };
 
+  // 원본 그대로 보여주기
   if (req.query.probe) {
     try {
-      const j = await getJSON(TREND);
-      const arr = Array.isArray(j) ? j : (j.trends || j.result || j.list || j.data || []);
-      out.steps.count = arr.length;
-      out.steps.keys = arr[0] ? Object.keys(arr[0]) : [];
-      out.steps.sample = arr.slice(0, 2);
-    } catch (e) { out.steps.error = String(e.message); }
-    res.status(200).json(out); return;
+      const { status, text } = await getText(TREND);
+      out.status = status;
+      out.len = text.length;
+      out.raw = text.slice(0, 1200);   // 앞부분 그대로
+    } catch (e) { out.error = String(e.message); }
+    res.status(200).json(out);
+    return;
   }
 
   try {
-    const rows = await trend();
+    const { status, text } = await getText(TREND);
+    if (status !== 200) { out.error = "status " + status; res.status(200).json(out); return; }
+    let j; try { j = JSON.parse(text); } catch (e) { out.error = "parse"; res.status(200).json(out); return; }
+    const arr = findArray(j);
+    const rows = arr.map((r) => ({
+      d: String(r.bizdate || r.localTradedAt || r.date || r.dt || ""),
+      indi: num(r.personalValue ?? r.individualValue ?? r.individual),
+      foreign: num(r.foreignValue ?? r.foreignerValue ?? r.foreigner),
+      inst: num(r.institutionalValue ?? r.organValue ?? r.organ),
+      pension: pensionOf(r),
+      kospi: num(r.closePrice ?? r.closeVal ?? r.ncv ?? r.nv ?? r.closeValue),
+    })).filter((x) => x.d);
+
     if (rows.length) {
       const asc = rows.slice().reverse();
-      // 연기금 필드가 아예 없으면 기관값으로 대체하고 표시 (fallback)
-      const hasPension = asc.some((x) => x.pension != null);
+      const hasP = asc.some((x) => x.pension != null);
       const val = (x) => (x.pension != null ? x.pension : x.inst);
-      out.pensionSource = hasPension ? "pension" : "institution"; // 화면에서 라벨 조정용
+      out.pensionSource = hasP ? "pension" : "institution";
       out.daily = asc.map((x) => ({ d: fmtDate(x.d), pension: Math.round(val(x) / 1e8), kospi: x.kospi || null }));
       const last5 = asc.slice(-5);
       out.who = [
@@ -76,12 +76,8 @@ module.exports = async (req, res) => {
         { key: "indi", v: Math.round(last5.reduce((s, x) => s + x.indi, 0) / 1e8) },
       ];
       out.ok = true;
-    } else {
-      out.steps.note = "데이터 없음";
-    }
-  } catch (e) {
-    out.error = String(e.message || e);
-  }
+    } else { out.note = "행 없음"; out.keys = arr[0] ? Object.keys(arr[0]) : []; }
+  } catch (e) { out.error = String(e.message || e); }
 
   res.setHeader("Cache-Control", "s-maxage=1800, stale-while-revalidate=7200");
   res.status(200).json(out);
